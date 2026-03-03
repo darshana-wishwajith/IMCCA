@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+imcca_venv/
+.venv/
+venv/
+ENV/
+env/
+.env
+.mypy_cache/
+.pytest_cache/
+.vscode/
