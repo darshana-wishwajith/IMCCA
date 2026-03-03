@@ -45,8 +45,8 @@ class InputController:
         # Only update if the value changed enough to matter
         if abs(self.last_j_x - x_val) > 0.05 or abs(self.last_j_y - y_val) > 0.05:
             
-            # Invert Y mapping for the gamepad to fix jump/crouch inversion in game
-            game_y = -y_val
+            # Y mapping for the gamepad (positive = UP = Jump)
+            game_y = y_val
             
             # 1. Analog Joystick Mapping
             self.gamepad.left_joystick_float(x_value_float=x_val, y_value_float=game_y)
