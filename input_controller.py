@@ -45,8 +45,11 @@ class InputController:
         # Only update if the value changed enough to matter
         if abs(self.last_j_x - x_val) > 0.05 or abs(self.last_j_y - y_val) > 0.05:
             
+            # Invert Y mapping for the gamepad to fix jump/crouch inversion in game
+            game_y = -y_val
+            
             # 1. Analog Joystick Mapping
-            self.gamepad.left_joystick_float(x_value_float=x_val, y_value_float=y_val)
+            self.gamepad.left_joystick_float(x_value_float=x_val, y_value_float=game_y)
             
             # 2. D-PAD Mapping (Crucial for Mortal Kombat 11)
             # Reset all DPAD buttons first
@@ -56,9 +59,9 @@ class InputController:
             self.gamepad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT)
             
             # Press appropriate DPAD buttons
-            if y_val > 0.5:
+            if game_y > 0.5:
                 self.gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_UP)
-            elif y_val < -0.5:
+            elif game_y < -0.5:
                 self.gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN)
                 
             if x_val < -0.5:
