@@ -1,257 +1,409 @@
 """
-main.py - IMCCA Project Entry Point
-Final Clean Version
+main.py — IMCCA v2 Entry Point
+Immersive Motion Combat Control Arena
+
+Exhibition-friendly Mortal Kombat 11 controller using full-body motion capture.
+Uses MediaPipe Pose ONLY (no Hands model) for maximum FPS and minimum latency.
 
 Controls:
-- Perform motions (Punch, Kick, Block, etc.) to control the game.
-- M to toggle SWIPE / PROPORTIONAL joystick mode.
-- ESC to quit.
-- Calibration happens automatically at startup.
+- Raise both hands above head → START capturing
+- Hands on hips → STOP capturing
+- Punch with right hand → Front Punch (J)
+- Punch with left hand → Back Punch (I)
+- Right leg kick → Front Kick (K)
+- Left leg kick → Back Kick (L)
+- Cross arms on chest → Block (O)
+- Both hands thrust forward → Throw (Space)
+- Lean left/right → Move Left/Right (A/D)
+- Jump → Jump (W)
+- Crouch/squat → Duck (S)
+- Quick body twist → Flip Stance (U)
+- Both hands high above head (hold) → Character Assist (P)
+
+Keyboard shortcuts:
+- ESC → Quit
+- R → Recalibrate
+- +/- → Adjust sensitivity
 """
 
 import cv2
 import time
-from body_skeleton import FullBodySkeleton, CameraConfig, PoseConfig, GlobalConfig
-from motion_detector import MotionDetector
-from swipe_detector import SwipeMotionDetector
-from input_controller import InputController
+import numpy as np
 
-def draw_ui(frame, actions, detector, fps, is_active, joy_x=0.0, joy_y=0.0, h_list=None, mode="swipe"):
+from config import (
+    CameraConfig, PoseConfig, SmoothingConfig,
+    ActionThresholds, UIConfig, MK11_KEYS, DEFAULT_COMBOS
+)
+from pose_tracker import PoseTracker
+from gesture_engine import GestureEngine
+from input_sender import InputSender
+
+
+# ─── ACTION DISPLAY CONFIG ────────────────────────────────────────
+
+ACTION_COLORS = {
+    "FRONT_PUNCH":  (0, 165, 255),    # Orange
+    "BACK_PUNCH":   (0, 100, 255),    # Red-orange
+    "FRONT_KICK":   (0, 255, 255),    # Yellow
+    "BACK_KICK":    (0, 255, 180),    # Yellow-green
+    "THROW":        (255, 0, 255),    # Magenta
+    "BLOCK":        (255, 50, 50),    # Blue
+    "MOVE_LEFT":    (255, 255, 0),    # Cyan
+    "MOVE_RIGHT":   (255, 255, 0),    # Cyan
+    "JUMP":         (0, 255, 0),      # Green
+    "DUCK":         (0, 200, 200),    # Dark yellow
+    "FLIP_STANCE":  (200, 100, 255),  # Pink
+    "CHAR_ASSIST":  (255, 200, 0),    # Light blue
+    "FATAL_BLOW":   (0, 0, 255),      # Bright red
+}
+
+ACTION_LABELS = {
+    "FRONT_PUNCH":  "FRONT PUNCH!",
+    "BACK_PUNCH":   "BACK PUNCH!",
+    "FRONT_KICK":   "FRONT KICK!",
+    "BACK_KICK":    "BACK KICK!",
+    "THROW":        "THROW!",
+    "BLOCK":        "BLOCKING",
+    "MOVE_LEFT":    "< MOVE LEFT",
+    "MOVE_RIGHT":   "MOVE RIGHT >",
+    "JUMP":         "JUMP!",
+    "DUCK":         "DUCK",
+    "FLIP_STANCE":  "FLIP STANCE",
+    "CHAR_ASSIST":  "CHAR ASSIST",
+    "FATAL_BLOW":   ">>> FATAL BLOW <<<",
+}
+
+
+def draw_ui(frame, engine, fps, is_active, ui_cfg):
+    """Draw the exhibition-friendly UI overlay."""
     h, w = frame.shape[:2]
     
-    # --- SLIM SIDEBAR (right side) ---
-    sw = 160
-    ov = frame.copy()
-    cv2.rectangle(ov, (w-sw, 0), (w, h), (20,20,20), -1)
-    cv2.addWeighted(ov, 0.7, frame, 0.3, 0, frame)
-    x0 = w - sw + 10
-    c_t, c_c = ("LIVE", (0,255,0)) if is_active else ("IDLE", (0,0,255))
-    cv2.putText(frame, c_t, (x0, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c_c, 2)
-    cv2.putText(frame, f"FPS: {int(fps)}", (x0, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+    # ─── TOP STATUS BAR ──────────────────────────────────
+    bar_h = 40
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, bar_h), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
     
-    # Mode indicator
-    if mode == "swipe":
-        cv2.putText(frame, "SWIPE", (x0, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,128), 2)
-        # Left hand: fist/open state
-        is_open = getattr(detector, '_hand_is_open', False)
-        fcount = getattr(detector, '_finger_count', 0)
-        if is_open:
-            cv2.putText(frame, f"LH OPEN({fcount})", (x0, 93), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,255,0), 1)
-        else:
-            cv2.putText(frame, f"LH FIST({fcount})", (x0, 93), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,0,255), 1)
-        # Left hand swipe hold state
-        s_state = getattr(detector, 'swipe_state', 'IDLE')
-        s_clr = (0,255,255) if 'HOLD' in s_state else (150,150,150)
-        cv2.putText(frame, s_state, (x0, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.3, s_clr, 1)
-        # Right hand: attack state
-        rh = getattr(detector, 'rh_state', '')
-        if rh == "PUNCH":
-            cv2.putText(frame, "RH: PUNCH!", (x0, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,165,255), 2)
-        elif rh == "KICK":
-            cv2.putText(frame, "RH: KICK!", (x0, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 2)
-        elif rh == "BLOCK":
-            cv2.putText(frame, "RH: BLOCK", (x0, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,255), 2)
-        else:
-            cv2.putText(frame, f"RH: idle", (x0, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120,120,120), 1)
+    # Status indicator
+    if is_active:
+        cv2.circle(frame, (20, 20), 8, (0, 255, 0), -1)
+        cv2.putText(frame, "LIVE", (35, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     else:
-        cv2.putText(frame, "POSITION", (x0, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,180,0), 2)
-        # Hand tracking status
-        hand_ok = getattr(detector, '_neutral_x', None) is not None
-        h_lbl, h_clr = ("TRACKING", (0,255,0)) if hand_ok else ("NO HAND", (0,0,255))
-        cv2.putText(frame, h_lbl, (x0, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, h_clr, 1)
+        cv2.circle(frame, (20, 20), 8, (0, 0, 255), -1)
+        cv2.putText(frame, "IDLE — Step fully into frame to START", (35, 27),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
     
-    cv2.putText(frame, "M=toggle", (x0, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (100,100,100), 1)
-    cv2.putText(frame, f"X:{joy_x:+.2f}", (x0, 158), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,255), 1)
-    cv2.putText(frame, f"Y:{joy_y:+.2f}", (x0, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,255), 1)
-    dirs = []
-    if joy_y > 0.15: dirs.append("UP")
-    if joy_y < -0.15: dirs.append("DN")
-    if joy_x < -0.15: dirs.append("L")
-    if joy_x > 0.15: dirs.append("R")
-    cv2.putText(frame, "-".join(dirs) if dirs else "CENTER", (x0, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
-    sens = getattr(detector, 'JOY_MAX_REACH', 0.06)
-    cv2.putText(frame, f"Sens: {sens:.3f}", (x0, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180,180,180), 1)
-    cv2.putText(frame, "+/- keys", (x0, 235), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100,100,100), 1)
+    # FPS
+    fps_color = (0, 255, 0) if fps > 25 else (0, 255, 255) if fps > 15 else (0, 0, 255)
+    cv2.putText(frame, f"FPS: {int(fps)}", (w - 100, 27),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, fps_color, 2)
     
-    # --- DRAW HAND LANDMARKS ---
-    if h_list:
-        for hand in h_list:
-            if hand["label"] == "Left":
-                # Yellow circle on left hand palm center
-                pcx, pcy = detector._get_palm_center(hand["landmarks"])
-                if pcx is not None:
-                    cv2.circle(frame, (int(pcx*w), int(pcy*h)), 8, (0,255,255), 2)
-                    cv2.circle(frame, (int(pcx*w), int(pcy*h)), 3, (0,255,255), -1)
-            elif hand["label"] == "Right" and mode == "swipe":
-                # Green circle on right hand palm center
-                pcx, pcy = detector._get_palm_center(hand["landmarks"])
-                if pcx is not None:
-                    cv2.circle(frame, (int(pcx*w), int(pcy*h)), 8, (0,255,0), 2)
-                    cv2.circle(frame, (int(pcx*w), int(pcy*h)), 3, (0,255,0), -1)
+    if not is_active:
+        # Draw large instruction text when idle
+        msg = "STEP FULLY INTO CAMERA FRAME"
+        text_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        tx = (w - text_size[0]) // 2
+        ty = h // 2
+        # Background
+        cv2.rectangle(frame, (tx - 20, ty - 35), (tx + text_size[0] + 20, ty + 15), (0, 0, 0), -1)
+        cv2.putText(frame, msg, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(frame, "to auto-start LIVE mode!", (tx + 60, ty + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+        return
     
-    # --- VIRTUAL JOYSTICK (bottom-left) ---
-    r_px = 50
-    gap = 25
-    cx, cy = r_px + gap + 20, h - r_px - gap - 40
+    # ─── ACTION DISPLAY (centered, large) ────────────────
+    actions = engine.active_actions
+    
+    # Flash border on attack actions
+    attack_actions = {"FRONT_PUNCH", "BACK_PUNCH", "FRONT_KICK", "BACK_KICK", "THROW", "FATAL_BLOW"}
+    for action in actions:
+        if action in attack_actions:
+            color = ACTION_COLORS.get(action, (255, 255, 255))
+            cv2.rectangle(frame, (0, 0), (w - 1, h - 1), color, 4)
+            cv2.rectangle(frame, (2, 2), (w - 3, h - 3), color, 2)
+    
+    # Show recent attack name (large, centered, fades out)
+    if engine.last_attack and (time.time() - engine.last_attack_time < 0.4):
+        label = ACTION_LABELS.get(engine.last_attack, engine.last_attack)
+        color = ACTION_COLORS.get(engine.last_attack, (255, 255, 255))
+        
+        # Large central text with shadow
+        font_scale = 1.5
+        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 3)[0]
+        tx = (w - text_size[0]) // 2
+        ty = h // 2 - 60
+        
+        # Shadow
+        cv2.putText(frame, label, (tx + 2, ty + 2), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, (0, 0, 0), 4)
+        # Text
+        cv2.putText(frame, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, color, 3)
+    
+    # ─── ACTIVE ACTIONS LIST (right sidebar) ─────────────
+    sw = ui_cfg.sidebar_width
+    ov = frame.copy()
+    cv2.rectangle(ov, (w - sw, bar_h), (w, h), (15, 15, 15), -1)
+    cv2.addWeighted(ov, 0.6, frame, 0.4, 0, frame)
+    
+    x0 = w - sw + 10
+    y0 = bar_h + 25
+    
+    cv2.putText(frame, "ACTIVE:", (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+    
+    y = y0 + 25
+    for action in actions:
+        if action.startswith("COMBO:"):
+            label = action.replace("COMBO:", "COMBO: ")
+            color = (0, 255, 255)
+        else:
+            label = ACTION_LABELS.get(action, action)
+            color = ACTION_COLORS.get(action, (200, 200, 200))
+        
+        cv2.putText(frame, label, (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        y += 20
+    
+    if not actions:
+        cv2.putText(frame, "-- none --", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+    
+    # Spine angle indicator
+    y += 15
+    angle = engine.spine_angle
+    angle_color = (0, 255, 255) if angle < engine.thresh.move_angle_threshold else (150, 150, 150)
+    cv2.putText(frame, f"Spine: {angle:.0f}° (thr:{engine.thresh.move_angle_threshold:.0f}°)",
+                (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, angle_color, 1)
+    
+    # ─── VIRTUAL JOYSTICK (bottom-left) ──────────────────
+    r = 45
+    gap = 20
+    cx, cy = r + gap + 15, h - r - gap - 30
+    
     ov2 = frame.copy()
-    cv2.circle(ov2, (cx, cy), r_px + gap, (0,0,0), -1) # Black margin
-    cv2.addWeighted(ov2, 0.5, frame, 0.5, 0, frame)
-    cv2.circle(frame, (cx, cy), r_px, (120,120,120), 2)
-    cv2.line(frame, (cx-r_px,cy), (cx+r_px,cy), (60,60,60), 1)
-    cv2.line(frame, (cx,cy-r_px), (cx,cy+r_px), (60,60,60), 1)
-    cv2.circle(frame, (cx, cy), 3, (200,200,200), -1)
+    cv2.circle(ov2, (cx, cy), r + gap, (0, 0, 0), -1)
+    cv2.addWeighted(ov2, 0.4, frame, 0.6, 0, frame)
     
-    # Active directions (can be multiple for diagonals)
+    # Joystick circle
+    cv2.circle(frame, (cx, cy), r, (80, 80, 80), 2)
+    cv2.line(frame, (cx - r, cy), (cx + r, cy), (40, 40, 40), 1)
+    cv2.line(frame, (cx, cy - r), (cx, cy + r), (40, 40, 40), 1)
+    cv2.circle(frame, (cx, cy), 3, (150, 150, 150), -1)
+    
+    # Direction labels
     active_dirs = set()
-    if joy_y > 0.15: active_dirs.add("UP")
-    elif joy_y < -0.15: active_dirs.add("DN")
-    if joy_x < -0.15: active_dirs.add("L")
-    elif joy_x > 0.15: active_dirs.add("R")
-        
-    # 4 labels with spacing (Black inactive, Yellow active)
-    loff = r_px + gap - 5
-    for lbl, pos in [("UP",(cx-10,cy-loff)),("DN",(cx-10,cy+loff+10)),("L",(cx-loff-12,cy+5)),("R",(cx+loff-5,cy+5))]:
-        clr = (0,255,255) if lbl in active_dirs else (0,0,0)
-        thick = 2 if lbl in active_dirs else 1
-        cv2.putText(frame, lbl, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.45, clr, thick)
-        
-    # Yellow dot
-    jx, jy = int(cx + joy_x*r_px), int(cy - joy_y*r_px)
-    if abs(joy_x) > 0.01 or abs(joy_y) > 0.01:
-        cv2.line(frame, (cx,cy), (jx,jy), (0,200,200), 2)
-    cv2.circle(frame, (jx, jy), 8, (0,255,255), -1)
+    mx, my = engine.move_x, engine.move_y
+    if mx < -0.3: active_dirs.add("L")
+    if mx > 0.3: active_dirs.add("R")
+    if my > 0.3: active_dirs.add("UP")
+    if my < -0.3: active_dirs.add("DN")
     
-    # Sensitivity display on the left panel (below joystick)
-    sens = getattr(detector, 'JOY_MAX_REACH', 0.06)
-    cv2.putText(frame, f"Sensitivity: {sens:.3f} (+/- adjust)", (20, cy + r_px + gap + 20), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
+    loff = r + gap - 5
+    for lbl, pos in [("W", (cx - 5, cy - loff)),
+                     ("S", (cx - 4, cy + loff + 10)),
+                     ("A", (cx - loff - 8, cy + 5)),
+                     ("D", (cx + loff - 3, cy + 5))]:
+        dir_map = {"W": "UP", "S": "DN", "A": "L", "D": "R"}
+        is_active_dir = dir_map[lbl] in active_dirs
+        clr = (0, 255, 255) if is_active_dir else (60, 60, 60)
+        thick = 2 if is_active_dir else 1
+        cv2.putText(frame, lbl, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.4, clr, thick)
+    
+    # Dot position
+    jx = int(cx + mx * r)
+    jy = int(cy - my * r)
+    jx = max(cx - r, min(cx + r, jx))
+    jy = max(cy - r, min(cy + r, jy))
+    
+    if abs(mx) > 0.05 or abs(my) > 0.05:
+        cv2.line(frame, (cx, cy), (jx, jy), (0, 200, 200), 2)
+    cv2.circle(frame, (jx, jy), 7, (0, 255, 255), -1)
+    
+    # ─── CONTROLS HELP (bottom-right) ────────────────────
+    help_y = h - 15
+    help_x = w - sw + 10
+    cv2.putText(frame, "R=Recalibrate  ESC=Quit", (help_x, help_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80, 80, 80), 1)
+    cv2.putText(frame, "+/-=Sensitivity", (help_x, help_y - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80, 80, 80), 1)
+    
+    # ─── MOTION GUIDE (bottom center) ────────────────────
+    guide_y = h - 10
+    guide_items = [
+        "Punch R/L = Front/Back Punch",
+        "Kick R/L = Front/Back Kick",
+        "Arms Crossed = Block",
+        "Lean = Move | Squat = Duck | Jump = Jump",
+    ]
+    for i, text in enumerate(guide_items):
+        ty = guide_y - (len(guide_items) - 1 - i) * 16
+        cv2.putText(frame, text, (140, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (120, 120, 120), 1)
+
+
 def main():
-    try:
-        from body_skeleton import HandsConfig
-        sk = FullBodySkeleton(
-            CameraConfig(mirror=True), 
-            PoseConfig(model_complexity=0), 
-            HandsConfig(max_num_hands=2),
-            global_cfg=GlobalConfig(processor="GPU")
-        )
-        det_prop  = MotionDetector()       # Original proportional mode
-        det_swipe = SwipeMotionDetector()   # New swipe mode
-        use_swipe = True                    # <<< Start with swipe mode (new default)
-        det = det_swipe
-        ctrl = InputController()
-    except Exception as e: print(f"Initialization Failed: {e}"); return
+    print("=" * 60)
+    print("  IMCCA v2 — Immersive Motion Combat Control Arena")
+    print("  Full-Body Motion Controller for Mortal Kombat 11")
+    print("=" * 60)
+    print()
     
-    mode_label = "SWIPE" if use_swipe else "POSITION"
-    print(f"IMCCA Started. Mode: {mode_label}  |  Press M to toggle mode.")
-    print("Gestures: 10-Fingers=START, Index+Middle Only=STOP. ESC to quit.")
-    prev = time.time()
-    is_active = False
+    try:
+        # Initialize modules
+        tracker = PoseTracker(
+            cam_cfg=CameraConfig(mirror=True),
+            pose_cfg=PoseConfig(model_complexity=0),
+            smooth_cfg=SmoothingConfig(ema_alpha=0.6),
+        )
+        engine = GestureEngine(
+            thresholds=ActionThresholds(),
+            combos=DEFAULT_COMBOS,
+        )
+        sender = InputSender(key_map=MK11_KEYS)
+        ui_cfg = UIConfig()
+        
+        print("[OK] All modules initialized.")
+        print()
+        print("INSTRUCTIONS:")
+        print("  1. Stand facing the camera in a neutral pose")
+        print("  2. Step FULLY into the frame to auto-start LIVE mode")
+        print("  3. Step out of the frame or obscure body to STOP")
+        print("  4. Press ESC to quit")
+        print()
+        
+    except Exception as e:
+        print(f"[FATAL] Initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    # State
+    is_active = False      # Starts idle until full body is detected
+    prev_time = time.time()
+    sensitivity_mult = 1.0
+    calibration_done = False
+    
+    # Start/stop gesture debounce
+    last_gesture_time = 0
     
     while True:
         try:
-            fr = sk.read_frame()
-            if fr is None: break
-            p_res, h_res = sk.infer(fr); p_dict = sk.get_pose_landmarks_dict(p_res)
-            h_list = sk.get_hand_landmarks_list(h_res) 
+            frame = tracker.read_frame()
+            if frame is None:
+                continue
             
-            # Check for Start/Stop Gestures (Finger Count)
-            gesture = det.check_gestures(h_list)
-            if gesture == "START":
-                if not is_active:
-                    print(">>> CAPTURING STARTED")
-                    is_active = True
-                    det.calibrate(p_dict, h_list) # Instant Auto-Calibration on startup
-            elif gesture == "STOP":
-                if is_active: print(">>> CAPTURING STOPPED"); is_active = False
-
-            acts = []
-            joy_x, joy_y = 0.0, 0.0
-            if is_active:
-                acts, joy_x, joy_y = det.detect(p_dict, h_list)
-                ctrl.handle_actions(acts)
-                ctrl.update_joystick(joy_x, joy_y)
+            # Process pose
+            landmarks, raw_results = tracker.process(frame)
+            
+            # Check full body visibility to toggle active mode automatically
+            if landmarks:
+                # 11,12: Shoulders | 15,16: Wrists | 23,24: Hips | 27,28: Ankles
+                key_points = [11, 12, 15, 16, 23, 24, 27, 28]
+                visible_points = sum(1 for idx in key_points if idx in landmarks and landmarks[idx][3] > 0.5)
                 
-                # Log attacks to terminal
-                for a in acts:
-                    if a in ("PUNCH_RIGHT", "KICK_RIGHT"):
-                        print(f">>> ATTACK: {a}")
+                # Require at least 6 out of 8 key points to be visible
+                if visible_points >= 6:
+                    if not is_active:
+                        print(">>> Full body detected! Auto-resuming LIVE mode.")
+                        is_active = True
+                else:
+                    if is_active:
+                        print(f">>> Full body lost (vis: {visible_points}/8)! Auto-pausing to IDLE mode.")
+                        is_active = False
+            else:
+                if is_active:
+                    print(">>> No body detected! Auto-pausing to IDLE mode.")
+                    is_active = False
+            
+            # Auto-calibrate on first valid frame (idle mode disabled)
+            now = time.time()
+            if not calibration_done and landmarks:
+                if engine.calibrate(landmarks, tracker):
+                    calibration_done = True
+                    print(">>> AUTO-CALIBRATED on first frame. Fight!")
+            
+            # Detect and send actions
+            if is_active and calibration_done:
+                actions = engine.detect(landmarks, tracker)
                 
-                # Print joystick direction to terminal (throttled)
-                if abs(joy_x) > 0.01 or abs(joy_y) > 0.01:
-                    _now = time.time()
-                    if not hasattr(det, '_last_joy_print') or _now - det._last_joy_print > 0.2:
-                        dirs = []
-                        if joy_y > 0.15: dirs.append("UP")
-                        if joy_y < -0.15: dirs.append("DOWN")
-                        if joy_x < -0.15: dirs.append("LEFT")
-                        if joy_x > 0.15: dirs.append("RIGHT")
-                        if dirs:
-                            print(f"JOY: {'-'.join(dirs)}  (X:{joy_x:+.2f} Y:{joy_y:+.2f})")
-                        det._last_joy_print = _now
+                # Handle combos specially
+                combo_actions = [a for a in actions if a.startswith("COMBO:")]
+                regular_actions = [a for a in actions if not a.startswith("COMBO:")]
                 
-            sk.draw_full_skeleton(fr, p_res, h_res)
-            now = time.time(); fps = 1.0 / (now - prev + 1e-6); prev = now
-            cur_mode = "swipe" if use_swipe else "position"
-            draw_ui(fr, acts, det, fps, is_active, joy_x, joy_y, h_list, mode=cur_mode)
-            cv2.imshow("IMCCA - Immersive Motion Combat Arena", fr)
+                # Send regular actions
+                sender.handle_actions(regular_actions)
+                
+                # Execute combos
+                for combo_action in combo_actions:
+                    combo_name = combo_action.replace("COMBO:", "")
+                    for combo_def in DEFAULT_COMBOS:
+                        if combo_def.name == combo_name:
+                            sender.execute_combo(combo_def.output_keys)
+                            print(f">>> COMBO: {combo_name}")
+                            break
+                
+                # Log attacks to console (throttled)
+                for a in regular_actions:
+                    if a in ("FRONT_PUNCH", "BACK_PUNCH", "FRONT_KICK", "BACK_KICK", "THROW"):
+                        key = MK11_KEYS.get(a, "?")
+                        print(f">>> {ACTION_LABELS.get(a, a)} → [{key.upper()}]")
+            else:
+                # Release everything when not active
+                sender.release_all()
+            
+            # Draw skeleton
+            tracker.draw_skeleton(frame, raw_results)
+            
+            # Calculate FPS
+            curr_time = time.time()
+            fps = 1.0 / max(curr_time - prev_time, 1e-6)
+            prev_time = curr_time
+            
+            # Draw UI
+            draw_ui(frame, engine, fps, is_active, ui_cfg)
+            
+            # Show window
+            cv2.imshow(ui_cfg.window_name, frame)
+            
+            # Handle keyboard
             key = cv2.waitKey(1) & 0xFF
-            if key == 27: break  # ESC
             
-            # --- MODE TOGGLE (M key) ---
-            elif key == ord('m') or key == ord('M'):
-                use_swipe = not use_swipe
-                det = det_swipe if use_swipe else det_prop
-                mode_label = "SWIPE" if use_swipe else "POSITION"
-                print(f">>> Mode switched to: {mode_label}")
-                # Re-calibrate the new detector with current pose
-                if is_active and p_dict:
-                    det.calibrate(p_dict, h_list)
-                ctrl.release_all()  # Release any held inputs during switch
+            if key == 27:  # ESC
+                break
             
-            # --- SENSITIVITY (+/- keys, mode-aware) ---
+            elif key == ord('r') or key == ord('R'):
+                # Recalibrate
+                if landmarks:
+                    engine.calibrate(landmarks, tracker)
+                    print(">>> Recalibrated!")
+            
             elif key == ord('+') or key == ord('='):
-                if use_swipe:
-                    det.ACTIVATION_DISPLACEMENT = max(0.01, det.ACTIVATION_DISPLACEMENT - 0.005)
-                    det.NEUTRAL_ZONE_RADIUS = max(0.008, det.NEUTRAL_ZONE_RADIUS - 0.003)
-                    print(f">>> [SWIPE] Sensitivity UP: Activ={det.ACTIVATION_DISPLACEMENT:.3f} Neutral={det.NEUTRAL_ZONE_RADIUS:.3f}")
-                else:
-                    det.JOY_MAX_REACH = max(0.02, det.JOY_MAX_REACH - 0.005)
-                    print(f">>> Sensitivity UP: {det.JOY_MAX_REACH:.3f}")
+                # Increase sensitivity (lower attack thresholds, raise angle threshold)
+                engine.thresh.punch_velocity = max(0.3, engine.thresh.punch_velocity * 0.85)
+                engine.thresh.kick_velocity = max(0.3, engine.thresh.kick_velocity * 0.85)
+                engine.thresh.move_angle_threshold = min(85.0, engine.thresh.move_angle_threshold + 2.0)
+                print(f">>> Sensitivity UP — Punch: {engine.thresh.punch_velocity:.2f} "
+                      f"Kick: {engine.thresh.kick_velocity:.2f} "
+                      f"MoveAngle: {engine.thresh.move_angle_threshold:.0f}°")
+            
             elif key == ord('-'):
-                if use_swipe:
-                    det.ACTIVATION_DISPLACEMENT = min(0.10, det.ACTIVATION_DISPLACEMENT + 0.005)
-                    det.NEUTRAL_ZONE_RADIUS = min(0.06, det.NEUTRAL_ZONE_RADIUS + 0.003)
-                    print(f">>> [SWIPE] Sensitivity DN: Activ={det.ACTIVATION_DISPLACEMENT:.3f} Neutral={det.NEUTRAL_ZONE_RADIUS:.3f}")
-                else:
-                    det.JOY_MAX_REACH = min(0.15, det.JOY_MAX_REACH + 0.005)
-                    print(f">>> Sensitivity DOWN: {det.JOY_MAX_REACH:.3f}")
+                # Decrease sensitivity (raise attack thresholds, lower angle threshold)
+                engine.thresh.punch_velocity *= 1.15
+                engine.thresh.kick_velocity *= 1.15
+                engine.thresh.move_angle_threshold = max(60.0, engine.thresh.move_angle_threshold - 2.0)
+                print(f">>> Sensitivity DOWN — Punch: {engine.thresh.punch_velocity:.2f} "
+                      f"Kick: {engine.thresh.kick_velocity:.2f} "
+                      f"MoveAngle: {engine.thresh.move_angle_threshold:.0f}°")
             
-            # --- RESET NEUTRAL (R key, mode-aware) ---
-            elif key == ord('r'):
-                if use_swipe:
-                    det.reset_neutral()
-                else:
-                    det._neutral_x = None
-                    det._neutral_y = None
-                    det._smooth_palm_x = None
-                    det._smooth_palm_y = None
-                    print(">>> Neutral center RESET")
-            
-            # --- ATTACK SENSITIVITY ([ ] keys, swipe mode only) ---
-            elif key == ord(']') and use_swipe:
-                det.ATTACK_DISP_THRESH = max(0.005, det.ATTACK_DISP_THRESH - 0.003)
-                print(f">>> Attack sensitivity UP: {det.ATTACK_DISP_THRESH:.3f} (easier to trigger)")
-            elif key == ord('[') and use_swipe:
-                det.ATTACK_DISP_THRESH = min(0.06, det.ATTACK_DISP_THRESH + 0.003)
-                print(f">>> Attack sensitivity DN: {det.ATTACK_DISP_THRESH:.3f} (harder to trigger)")
         except Exception as e:
-            print(f"Main loop error: {e}")
+            print(f"[ERROR] Main loop: {e}")
             import traceback
             traceback.print_exc()
-            # Continue gracefully to the next frame instead of crashing or freezing
             continue
+    
+    # Cleanup
+    print("\nShutting down...")
+    sender.shutdown()
+    tracker.close()
+    print("IMCCA v2 terminated.")
 
-    sk.close()
-    if 'ctrl' in locals(): ctrl.release_all()
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
